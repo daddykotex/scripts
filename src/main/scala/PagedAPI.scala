@@ -1,7 +1,7 @@
 import fs2.{io => fs2io, _}, fs2.concurrent._
 import cats._, cats.implicits._, cats.effect._, cats.effect.implicits._, scala.concurrent.duration._
 
-import io.circe._, io.circe.parser._, io.circe.generic.semiauto._
+import io.circe._, io.circe.generic.semiauto._
 import io.circe.fs2._
 
 import org.http4s._
@@ -12,18 +12,23 @@ import org.http4s.client.blaze._
 import org.http4s.client.dsl.io._
 import org.http4s.client._
 import org.http4s.Uri
+import cats.effect.concurrent.Deferred
 
 object PagedAPI extends IOApp {
 
   val baseUri = Uri.uri("https://gitlab.com/api/v4/projects/inkscape%2Finkscape/issues")
-  val baseRequest = GET(
-    baseUri,
-    Header("PRIVATE-TOKEN", sys.env("GITLAB_TOKEN")),
-    Accept(MediaType.application.json)
-  )
+  val baseRequest = IO(System.getenv("GITLAB_TOKEN")).flatMap { token =>
+    GET(
+      baseUri,
+      Header("PRIVATE-TOKEN", token),
+      Accept(MediaType.application.json)
+    )
+  }
 
   def withClient[T](f: Client[IO] => IO[T]): IO[T] = {
-    BlazeClientBuilder[IO](scala.concurrent.ExecutionContext.global).resource.use { client =>
+    BlazeClientBuilder[IO](scala.concurrent.ExecutionContext.global)
+    //.withMaxTotalConnections(1) with this, you'd normally hang after one page
+    .resource.use { client =>
       f(client)
     }
   }
@@ -54,43 +59,51 @@ object PagedAPI extends IOApp {
   final case class GitlabIssue(state: String, title: String)
   implicit val gitlabIssueDecoder: Decoder[GitlabIssue] = deriveDecoder[GitlabIssue]
 
-  def issuesStream(client: Client[IO])(uri: Uri): Stream[IO, (Stream[IO, GitlabIssue], Option[Uri])] = {
+  def issuesStream(client: Client[IO])(uri: Uri): IO[(Stream[IO, GitlabIssue], IO[Option[Uri]])] = {
     val request = baseRequest.map(_.withUri(uri))
-    Stream
-      .eval(IO.delay(println(s"starting for ${uri.renderString}")))
-      .evalMap(_ => request)
-      .flatMap(client.stream)
-      .evalMap { response =>
-        val nextPage = getNextUri(response)
-        val issues = response.bodyAsText.through(stringArrayParser).through(decoder[IO, GitlabIssue])
-        IO.delay(println(s"done for ${uri.renderString} and next page $nextPage"))
-          .as((issues, nextPage))
-      }
+
+    Deferred[IO, Option[Uri]].map { promise =>
+      val issues = Stream
+        .eval(IO.delay(println(s"starting for ${uri.renderString}")))
+        .evalMap(_ => request)
+        .flatMap(client.stream)
+        .flatMap { response =>
+          val nextPage = getNextUri(response)
+          val issues = response.body.through(byteArrayParser).through(decoder[IO, GitlabIssue])
+          Stream.eval_(
+            IO.delay(println(s"done for ${uri.renderString} and next page $nextPage")) *>
+              promise.complete(nextPage)
+          ) ++ issues
+        }
+
+      (issues, promise.get)
+    }
   }
 
-  def getIssues(client: Client[IO]): Stream[IO, GitlabIssue] = {
-    def go(onePage: (Stream[IO, GitlabIssue], Option[Uri])): Stream[IO, GitlabIssue] = {
-      onePage match {
-        case (issues, None) =>
-          issues
-        case (issues, Some(uri)) =>
-          Stream(
-            issues,
-            issuesStream(client)(uri).flatMap(pair => go(pair))
-          ).parJoinUnbounded
+  def getIssues(client: Client[IO]): Stream[IO, GitlabIssue] =
+    // Note that even though we're always lifting issuesStream from IO to Stream,
+    // I kept the method as IO to make it explicit it doesn't carry any resources
+    Stream.force {
+      def go(page: Stream[IO, GitlabIssue], nextPageUri: IO[Option[Uri]]): Stream[IO, GitlabIssue] = {
+        //response closes in this ++
+        page ++
+          Stream
+            .eval(nextPageUri)
+            .flatMap(_.foldMap(uri => Stream.eval(issuesStream(client)(uri)).flatMap((go _).tupled)))
+
       }
+
+      issuesStream(client)(getRequestUri(Some("1"))).map((go _).tupled)
     }
-    issuesStream(client)(getRequestUri(Some("1"))).flatMap(go(_))
-  }
 
   def run(args: List[String]): IO[ExitCode] =
     // If I take < 200, it work, but above that, it just hang
     withClient(
       getIssues(_)
         .take(201)
-        .evalScan(0) { case (count, _) =>
-          IO.delay(println(count)).as(count + 1)
-        }
+        .debug()
+        .scan(0)((count, _) => count + 1)
+        .showLinesStdOut
         .compile
         .drain
     ).as(ExitCode.Success)
