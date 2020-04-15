@@ -96,6 +96,27 @@ object PagedAPI extends IOApp {
       issuesStream(client)(getRequestUri(Some("1"))).map((go _).tupled)
     }
 
+  def getIssues2(client: Client[IO]): Stream[IO, GitlabIssue] = {
+    def getPage(uri: Uri, jobQueue: Queue[IO, Option[Uri]]): Stream[IO, GitlabIssue] = {
+      Stream
+        .eval(baseRequest.map(_.withUri(uri)))
+        .flatMap(client.stream)
+        .flatMap { response =>
+          val maybeNextUri = getNextUri(response)
+          val publishJob = jobQueue.enqueue1(maybeNextUri)
+          val issues =response.body.through(byteArrayParser).through(decoder[IO, GitlabIssue])
+          Stream.eval_(publishJob) ++ issues
+        }
+    }
+    val dequeue = for {
+      jobQueue <- Queue.unbounded[IO, Option[Uri]]
+      _ <- jobQueue.enqueue1(Some(getRequestUri(Some("1"))))
+    } yield jobQueue.dequeue.unNoneTerminate.flatMap(getPage(_, jobQueue))
+
+    Stream.force(dequeue)
+  }
+
+
   def run(args: List[String]): IO[ExitCode] =
     // If I take < 200, it work, but above that, it just hang
     withClient(
